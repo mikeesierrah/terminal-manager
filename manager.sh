@@ -321,6 +321,186 @@ setup_nginx_ssl() {
     systemctl reload nginx
 }
 
+install_telegram_bot() {
+    echo "Installing dependencies..."
+
+    apt install -y python3 python3-pip python3-venv
+
+    mkdir -p /opt/terminal-manager-bot
+    cd /opt/terminal-manager-bot || exit
+
+    python3 -m venv venv
+    source venv/bin/activate
+
+    pip install --upgrade pip
+    pip install python-telegram-bot
+
+    echo "Dependencies installed."
+
+    read -p "Enter Telegram Bot Token: " BOT_TOKEN
+    read -p "Enter Admin Telegram User IDs (space-separated): " ADMIN_IDS
+
+    # Convert space-separated admin IDs into a Python list format
+    FORMATTED_ADMIN_IDS=$(echo "$ADMIN_IDS" | sed 's/ /, /g')
+
+    BOT_SCRIPT="/opt/terminal-manager-bot/bot.py"
+    cat >"$BOT_SCRIPT" <<EOF
+#!/usr/bin/env python3
+
+import os
+import json
+import logging
+from telegram import Update
+from telegram.ext import Application, CommandHandler, CallbackContext
+
+TOKEN = "$BOT_TOKEN"
+ADMIN_IDS = [$FORMATTED_ADMIN_IDS]  # Convert input to a list
+DOMAIN = "$DOMAIN"  # The domain input by the user
+
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
+
+async def start(update: Update, context: CallbackContext) -> None:
+    if is_admin(update.effective_user.id):
+        await update.message.reply_text("Welcome, Admin.")
+    else:
+        await update.message.reply_text("You are not authorized to use this bot.")
+
+async def help(update: Update, context: CallbackContext) -> None:
+    help_text = """
+    Available Commands:
+    /start - Start the bot
+    /help - Show this help message
+    /list - List all configured terminals
+    /add NODE IP PORT - Add or update a terminal
+    /remove NODE - Remove a terminal
+    """
+    await update.message.reply_text(help_text)
+
+async def list_terminals(update: Update, context: CallbackContext) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+
+    config_file = "/etc/terminal-manager/terminals.json"
+    if not os.path.exists(config_file):
+        await update.message.reply_text("No terminals configured.")
+        return
+
+    with open(config_file, "r") as file:
+        data = json.load(file)
+        terminals = data.get("terminals", [])
+
+    if not terminals:
+        await update.message.reply_text("No terminals configured.")
+        return
+
+    response_lines = ["*Configured Terminals:*", ""]
+    for idx, term in enumerate(terminals, start=1):
+        node = term["path"].lstrip('/')
+        full_url = f"{DOMAIN.rstrip('/')}/{node}"
+        response_lines.append(f"*{idx}. {full_url}*")
+        response_lines.append(f"   _IP:_ {term['ip']}")
+        response_lines.append(f"   _Port:_ {term['port']}\n")
+
+    response = "\n".join(response_lines)
+    await update.message.reply_text(response, parse_mode="Markdown")
+
+async def add_terminal(update: Update, context: CallbackContext) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+
+    if len(context.args) < 3:
+        await update.message.reply_text("Usage: /add NODE IP PORT")
+        return
+
+    path, ip, port = context.args
+    path = f"/{path.lstrip('/')}"
+    config_file = "/etc/terminal-manager/terminals.json"
+
+    terminals = []
+    if os.path.exists(config_file):
+        with open(config_file, "r") as file:
+            terminals = json.load(file).get("terminals", [])
+
+    for term in terminals:
+        if term["path"] == path:
+            term.update({"ip": ip, "port": port})
+            break
+    else:
+        terminals.append({"path": path, "ip": ip, "port": port})
+
+    with open(config_file, "w") as file:
+        json.dump({"terminals": terminals}, file, indent=4)
+
+    await update.message.reply_text(f"Added/Updated terminal: {path}")
+
+async def remove_terminal(update: Update, context: CallbackContext) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+
+    if len(context.args) < 1:
+        await update.message.reply_text("Usage: /remove NODE")
+        return
+
+    path = f"/{context.args[0].lstrip('/')}"
+    config_file = "/etc/terminal-manager/terminals.json"
+
+    if not os.path.exists(config_file):
+        await update.message.reply_text("No terminals configured.")
+        return
+
+    with open(config_file, "r") as file:
+        data = json.load(file)
+
+    terminals = [t for t in data.get("terminals", []) if t["path"] != path]
+
+    with open(config_file, "w") as file:
+        json.dump({"terminals": terminals}, file, indent=4)
+
+    await update.message.reply_text(f"Removed terminal: {path}")
+
+def main():
+    app = Application.builder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help))  # Add the help command
+    app.add_handler(CommandHandler("list", list_terminals))
+    app.add_handler(CommandHandler("add", add_terminal))
+    app.add_handler(CommandHandler("remove", remove_terminal))
+
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
+EOF
+
+    chmod +x "$BOT_SCRIPT"
+    echo "Bot script installed at /opt/terminal-manager-bot/bot.py."
+
+    # Create systemd service for auto-start
+    SYSTEMD_SERVICE="/etc/systemd/system/terminal-manager-bot.service"
+    cat >"$SYSTEMD_SERVICE" <<EOF
+[Unit]
+Description=Terminal Manager Telegram Bot
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/terminal-manager-bot
+ExecStart=/opt/terminal-manager-bot/venv/bin/python /opt/terminal-manager-bot/bot.py
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now terminal-manager-bot
+    echo "Bot service started."
+}
+
 # Main installation process
 main() {
     install_packages
@@ -329,6 +509,7 @@ main() {
     create_utility_script
     create_web_interface
     setup_nginx_ssl
+    install_telegram_bot
 
     # Display completion message
     echo "Setup complete!"
